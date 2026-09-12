@@ -1,0 +1,40 @@
+# Secrets and machine-specific configuration
+local.env
+local.env.*
+!local.env.example
+.env
+.env.*
+!.env.example
+.envrc
+telegram-token.txt*
+*.pem
+*.key
+*.p12
+*.pfx
+*.p8
+*.ppk
+
+# Runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+**/settings.local.json
+.DS_Store
+Thumbs.db
