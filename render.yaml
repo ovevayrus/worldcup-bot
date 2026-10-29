@@ -3,9 +3,13 @@ services:
     name: worldcup-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --only-binary=:all: --require-hashes -r requirements.lock
     startCommand: python bot.py
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: WORLDCUP_MODE
+        value: webhook
       - key: WORLDCUP_BOT_TOKEN
         sync: false
       - key: WORLDCUP_ALLOWED_CHAT_IDS
