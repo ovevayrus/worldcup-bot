@@ -38,3 +38,6 @@ htmlcov/
 **/settings.local.json
 .DS_Store
 Thumbs.db
+
+# Isolated offline-test home
+.test-tmp/

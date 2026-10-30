@@ -31,6 +31,9 @@ class FakeApplication:
     def add_handler(self, handler):
         self.handlers.append(handler)
 
+    def add_error_handler(self, handler):
+        self.error_handler = handler
+
     def run_webhook(self, **kwargs):
         self.webhook_kwargs = kwargs
 
@@ -45,6 +48,10 @@ class FakeApplicationBuilder:
 
     def token(self, value):
         self.token_value = value
+        return self
+
+    def post_init(self, callback):
+        self.application.preflight = callback
         return self
 
     def build(self):
@@ -176,7 +183,10 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_whereami_is_available_before_allowlisting(self):
         update = make_update(chat_id=-1001, user_id=200)
-        with patch.object(bot, "ALLOWED_CHAT_IDS", frozenset()):
+        with (
+            patch.object(bot, "ALLOWED_CHAT_IDS", frozenset()),
+            patch.object(bot, "admit_command", return_value=True),
+        ):
             await bot.whereami(update, SimpleNamespace())
         reply = update.message.replies[0][0]
         self.assertIn("200", reply)

@@ -23,10 +23,14 @@ Runs in two modes, picked automatically:
 Matches are added manually with /addmatch as the tournament goes on.
 """
 
+import asyncio
+import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
+from functools import wraps
 from urllib.parse import urlsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -120,9 +124,7 @@ ADMIN_USER_IDS = parse_id_set(
 )
 WEBHOOK_SECRET = get_config("WORLDCUP_WEBHOOK_SECRET")
 WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
-VOTE_CALLBACK_RE = re.compile(
-    r"^vote:([1-9][0-9]{0,18}):(home|draw|away)$"
-)
+VOTE_CALLBACK_RE = re.compile(r"^vote:([1-9][0-9]{0,18}):(home|draw|away)$")
 
 DB_FILE = os.path.join(BASE_DIR, "worldcup.db")
 
@@ -169,6 +171,43 @@ def parse_webhook_config(port_value, public_url, secret):
         )
     return port, public_url.rstrip("/")
 
+
+# Explicit finite work limits; these do not choose a financial budget.
+def limit_setting(name, default, maximum):
+    raw = get_config(name)
+    try:
+        value = int(raw) if raw else default
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer.") from exc
+    if not 1 <= value <= maximum:
+        raise SystemExit(f"{name} must be between 1 and {maximum}.")
+    return value
+
+
+GLOBAL_PER_MINUTE = limit_setting("WORLDCUP_GLOBAL_PER_MINUTE", 120, 10000)
+USER_PER_MINUTE = limit_setting("WORLDCUP_USER_PER_MINUTE", 10, 1000)
+CHAT_PER_MINUTE = limit_setting("WORLDCUP_CHAT_PER_MINUTE", 30, 1000)
+MAX_PLAYERS = limit_setting("WORLDCUP_MAX_PLAYERS", 500, 10000)
+MAX_MATCHES = limit_setting("WORLDCUP_MAX_MATCHES", 1000, 10000)
+MAX_RECEIPTS = limit_setting("WORLDCUP_MAX_RECEIPTS", 100000, 1000000)
+RECEIPT_SECONDS = 48 * 60 * 60
+PAGE_SIZE = 20
+MAX_PAGE = 500
+MEMBERSHIP_SECONDS = 300
+MAX_MEMBERSHIPS = 2000
+DATABASE_TIMEOUT_SECONDS = 5
+ALLOW_WEBHOOK_RESET = get_config("WORLDCUP_ALLOW_WEBHOOK_RESET").lower() == "true"
+LOGGER = logging.getLogger(__name__)
+
+
+class DuplicateUpdate(Exception):
+    """The database already committed this Telegram mutation."""
+
+
+class WorkLimitError(Exception):
+    """An explicit finite operation or storage limit was reached."""
+
+
 # ---------------------------------------------------------------- database
 
 SCHEMA_SQLITE = """
@@ -193,6 +232,24 @@ SCHEMA_SQLITE = """
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS processed_updates (
+        update_id BIGINT PRIMARY KEY,
+        processed_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS processed_updates_time ON processed_updates(processed_at);
+    CREATE TABLE IF NOT EXISTS command_limits (
+        scope TEXT PRIMARY KEY,
+        window_start BIGINT NOT NULL,
+        amount INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS membership_cache (
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        visible INTEGER NOT NULL,
+        expires_at BIGINT NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    );
+
 """
 
 SCHEMA_POSTGRES = """
@@ -217,6 +274,24 @@ SCHEMA_POSTGRES = """
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS processed_updates (
+        update_id BIGINT PRIMARY KEY,
+        processed_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS processed_updates_time ON processed_updates(processed_at);
+    CREATE TABLE IF NOT EXISTS command_limits (
+        scope TEXT PRIMARY KEY,
+        window_start BIGINT NOT NULL,
+        amount INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS membership_cache (
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        visible INTEGER NOT NULL,
+        expires_at BIGINT NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    );
+
 """
 
 
@@ -241,27 +316,177 @@ class PgConnWrapper:
 
 
 @contextmanager
-def db():
+def db(*, serialized=False, update=None):
+    """One bounded transaction. Mutation receipts commit with their state changes."""
     if DATABASE_URL:
         import psycopg2
         import psycopg2.extras
 
         conn = psycopg2.connect(
-            DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor
+            DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=DATABASE_TIMEOUT_SECONDS,
+            options="-c statement_timeout=5000 -c lock_timeout=5000",
         )
-        try:
-            yield PgConnWrapper(conn)
-            conn.commit()
-        finally:
-            conn.close()
+        wrapper = PgConnWrapper(conn)
     else:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=DATABASE_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        deadline = time.monotonic() + DATABASE_TIMEOUT_SECONDS
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        wrapper = conn
+    try:
+        if serialized or update is not None:
+            if DATABASE_URL:
+                # All consumers of this one pool use the same transaction lock.
+                wrapper.execute("SELECT pg_advisory_xact_lock(902817401)")
+            else:
+                wrapper.execute("BEGIN IMMEDIATE")
+        if update is not None:
+            claim_update(wrapper, update)
+        yield wrapper
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def claim_update(conn, update):
+    update_id = getattr(update, "update_id", None)
+    if (
+        not isinstance(update_id, int)
+        or isinstance(update_id, bool)
+        or not 0 <= update_id < 2**63
+    ):
+        raise WorkLimitError("Telegram update ID missing or invalid.")
+    now = int(time.time())
+    conn.execute(
+        "DELETE FROM processed_updates WHERE processed_at < ?", (now - RECEIPT_SECONDS,)
+    )
+    if conn.execute(
+        "SELECT update_id FROM processed_updates WHERE update_id = ?", (update_id,)
+    ).fetchone():
+        raise DuplicateUpdate()
+    count = conn.execute("SELECT COUNT(*) AS n FROM processed_updates").fetchone()["n"]
+    if count >= MAX_RECEIPTS:
+        raise WorkLimitError("Update receipt capacity reached. Try later.")
+    conn.execute(
+        "INSERT INTO processed_updates (update_id, processed_at) VALUES (?, ?)",
+        (update_id, now),
+    )
+
+
+def admit_command(chat_id, user_id):
+    now = int(time.time())
+    window = now // 60
+    scopes = (
+        ("global", GLOBAL_PER_MINUTE),
+        (f"chat:{chat_id}", CHAT_PER_MINUTE),
+        (f"user:{user_id}", USER_PER_MINUTE),
+    )
+    with db(serialized=True) as conn:
+        conn.execute("DELETE FROM command_limits WHERE window_start < ?", (window - 1,))
+        for scope, ceiling in scopes:
+            row = conn.execute(
+                "SELECT window_start, amount FROM command_limits WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            if row and row["window_start"] == window and row["amount"] >= ceiling:
+                return False
+        for scope, _ in scopes:
+            conn.execute(
+                "INSERT INTO command_limits (scope, window_start, amount) VALUES (?, ?, 1) "
+                "ON CONFLICT(scope) DO UPDATE SET window_start = excluded.window_start, "
+                "amount = CASE WHEN command_limits.window_start = excluded.window_start "
+                "THEN command_limits.amount + 1 ELSE 1 END",
+                (scope, window),
+            )
+    return True
+
+
+def bounded(*, admin=False):
+    def decorate(handler):
+        @wraps(handler)
+        async def guarded(update, context):
+            if not await (
+                require_admin(update) if admin else require_allowed_chat(update)
+            ):
+                return
+            user = update.effective_user
+            if not user:
+                await deny_access(
+                    update, "Telegram did not include a user for this command."
+                )
+                return
+            try:
+                if not admit_command(update.effective_chat.id, user.id):
+                    await deny_access(
+                        update, "Work limit reached. Please retry next minute."
+                    )
+                    return
+                async with asyncio.timeout(10):
+                    return await handler(update, context)
+            except DuplicateUpdate:
+                await deny_access(update, "This update was already processed.")
+            except WorkLimitError as exc:
+                await deny_access(update, str(exc))
+
+        return guarded
+
+    return decorate
+
+
+def page_number(context):
+    args = context.args or []
+    if not args:
+        return 1
+    if len(args) != 1 or not args[0].isdigit() or not 1 <= int(args[0]) <= MAX_PAGE:
+        raise WorkLimitError(f"Use a page number from 1 to {MAX_PAGE}.")
+    return int(args[0])
+
+
+async def is_current_member(context, chat_id, user_id):
+    now = int(time.time())
+    with db() as conn:
+        row = conn.execute(
+            "SELECT visible, expires_at FROM membership_cache WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
+        ).fetchone()
+    if row and row["expires_at"] > now:
+        return bool(row["visible"])
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id,
+            user_id,
+            read_timeout=5,
+            write_timeout=5,
+            connect_timeout=5,
+            pool_timeout=5,
+        )
+        visible = member.status not in ("left", "kicked")
+    except TelegramError:
+        return False
+    with db(serialized=True) as conn:
+        conn.execute("DELETE FROM membership_cache WHERE expires_at <= ?", (now,))
+        count = conn.execute("SELECT COUNT(*) AS n FROM membership_cache").fetchone()[
+            "n"
+        ]
+        if count < MAX_MEMBERSHIPS or row:
+            conn.execute(
+                "INSERT INTO membership_cache (chat_id, user_id, visible, expires_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET visible=excluded.visible, expires_at=excluded.expires_at",
+                (chat_id, user_id, int(visible), now + MEMBERSHIP_SECONDS),
+            )
+    return visible
+
+
+async def report_error(update, context):
+    # Never let framework exception tracebacks log token-bearing URLs or database DSNs.
+    LOGGER.error("Bot operation failed (%s)", type(context.error).__name__)
+    if update is not None:
+        await deny_access(update, "That operation failed. Please try again later.")
 
 
 def init_db():
@@ -325,9 +550,7 @@ def get_next_open_match(conn, current_id):
 
 
 def vote_keyboard(m):
-    buttons = [
-        InlineKeyboardButton(m["home"], callback_data=f"vote:{m['id']}:home")
-    ]
+    buttons = [InlineKeyboardButton(m["home"], callback_data=f"vote:{m['id']}:home")]
     if not m["knockout"]:
         buttons.append(
             InlineKeyboardButton("Draw", callback_data=f"vote:{m['id']}:draw")
@@ -390,11 +613,14 @@ async def whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or not update.effective_message:
         return
     user_id = user.id if user else "unavailable"
+    if not admit_command(chat.id, user.id if user else 0):
+        return
     await update.effective_message.reply_text(
         f"Your user ID: {user_id}\nThis chat ID: {chat.id}"
     )
 
 
+@bounded()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update):
         return
@@ -402,9 +628,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_player(user.id):
         await update.message.reply_text(f"You're already in, {user.first_name}!")
         return
-    with db() as conn:
+    with db(update=update) as conn:
+        if (
+            conn.execute("SELECT COUNT(*) AS n FROM players").fetchone()["n"]
+            >= MAX_PLAYERS
+        ):
+            raise WorkLimitError(
+                "Player capacity reached. Ask the owner to review pool retention."
+            )
         conn.execute(
-            "INSERT INTO players (user_id, name) VALUES (?, ?)",
+            "INSERT INTO players (user_id, name) VALUES (?, ?) ON CONFLICT(user_id) DO NOTHING",
             (user.id, user.first_name),
         )
     await update.message.reply_text(
@@ -413,6 +646,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded()
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed_chat(update):
         return
@@ -428,6 +662,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded(admin=True)
 async def addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return
@@ -444,13 +679,19 @@ async def addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
     home, away = (part.strip() for part in text.split(" vs ", 1))
-    if not home or not away:
+    if not home or not away or len(home) > 80 or len(away) > 80:
         await update.message.reply_text(usage)
         return
-    with db() as conn:
+    with db(update=update) as conn:
+        if (
+            conn.execute("SELECT COUNT(*) AS n FROM matches").fetchone()["n"]
+            >= MAX_MATCHES
+        ):
+            raise WorkLimitError(
+                "Match capacity reached. Ask the owner to export/archive the pool."
+            )
         new_id = conn.execute(
-            "INSERT INTO matches (home, away, knockout) VALUES (?, ?, ?) "
-            "RETURNING id",
+            "INSERT INTO matches (home, away, knockout) VALUES (?, ?, ?) RETURNING id",
             (home, away, knockout),
         ).fetchone()["id"]
     note = " (knockout — no draw option)" if knockout else ""
@@ -459,11 +700,18 @@ async def addmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded()
 async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed_chat(update):
         return
+    page = page_number(context)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM matches ORDER BY id").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM matches ORDER BY id LIMIT ? OFFSET ?",
+            (PAGE_SIZE + 1, (page - 1) * PAGE_SIZE),
+        ).fetchall()
+    has_more = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     if not rows:
         await update.message.reply_text("No matches yet. Add one with /addmatch.")
         return
@@ -484,8 +732,11 @@ async def matches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         length += len(line) + 1
     if chunk:
         await update.message.reply_text("\n".join(chunk))
+    if has_more:
+        await update.message.reply_text(f"More matches: /matches {page + 1}")
 
 
+@bounded()
 async def vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_user(update):
         return
@@ -522,6 +773,7 @@ async def vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded(admin=True)
 async def next_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return
@@ -529,7 +781,7 @@ async def next_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /next game")
         return
 
-    with db() as conn:
+    with db(update=update) as conn:
         current_match = get_current_match(conn)
         if not current_match:
             await update.message.reply_text("No open matches to vote on right now.")
@@ -551,6 +803,7 @@ async def next_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded()
 async def vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await require_allowed_chat(update):
@@ -572,7 +825,7 @@ async def vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     match_id = int(callback_match.group(1))
     pick = callback_match.group(2)
-    with db() as conn:
+    with db(update=update) as conn:
         m = conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
         if not m:
             await query.answer("That match no longer exists.", show_alert=True)
@@ -596,6 +849,7 @@ async def vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded()
 async def invalid_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed_chat(update):
         return
@@ -604,6 +858,7 @@ async def invalid_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded(admin=True)
 async def result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin(update):
         return
@@ -615,7 +870,7 @@ async def result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /result <match_id> <home|draw|away>")
         return
     match_id = int(match_id)
-    with db() as conn:
+    with db(update=update) as conn:
         m = conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
         if not m:
             await update.message.reply_text(
@@ -628,15 +883,15 @@ async def result(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "(home or away), even if it went to penalties."
             )
             return
-        conn.execute(
-            "UPDATE matches SET result = ? WHERE id = ?", (outcome, match_id)
-        )
+        conn.execute("UPDATE matches SET result = ? WHERE id = ?", (outcome, match_id))
         winners = conn.execute(
             "SELECT p.name FROM votes v JOIN players p ON p.user_id = v.user_id "
-            "WHERE v.match_id = ? AND v.pick = ?",
+            "WHERE v.match_id = ? AND v.pick = ? LIMIT 21",
             (match_id, outcome),
         ).fetchall()
-    winner_names = ", ".join(w["name"] for w in winners) if winners else "nobody"
+    winner_names = ", ".join(w["name"] for w in winners[:20]) if winners else "nobody"
+    if len(winners) > 20:
+        winner_names += ", and more (see /leaderboard)"
     await update.message.reply_text(
         f"{match_label(m)} — FINAL: {OUTCOME_LABELS[outcome]}\n"
         f"Correct picks: {winner_names}\n"
@@ -644,10 +899,12 @@ async def result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@bounded()
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed_chat(update):
         return
     chat = update.effective_chat
+    page = page_number(context)
     with db() as conn:
         rows = conn.execute(
             """
@@ -658,39 +915,50 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             LEFT JOIN votes v ON v.user_id = p.user_id
             LEFT JOIN matches m ON m.id = v.match_id
             GROUP BY p.user_id, p.name
-            ORDER BY correct DESC, scored ASC, p.name
-            """
+            ORDER BY correct DESC, scored ASC, p.name, p.user_id
+            LIMIT ? OFFSET ?
+            """,
+            (PAGE_SIZE + 1, (page - 1) * PAGE_SIZE),
         ).fetchall()
+    has_more = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     if chat.type != "private":
         # In a group chat, only rank players who are members of that group.
         in_group = []
-        for r in rows:
-            try:
-                member = await context.bot.get_chat_member(chat.id, r["user_id"])
-            except TelegramError:
-                continue
-            if member.status not in ("left", "kicked"):
-                in_group.append(r)
+        for row in rows:
+            if await is_current_member(context, chat.id, row["user_id"]):
+                in_group.append(row)
         rows = in_group
     if not rows:
-        await update.message.reply_text("No players yet. Send /start to join!")
+        await update.message.reply_text(
+            "No visible players on this page. Use /start to join, or request another leaderboard page."
+        )
         return
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 World Cup Prediction Leaderboard"]
-    for i, r in enumerate(rows):
+    for i, r in enumerate(rows, start=(page - 1) * PAGE_SIZE):
         rank = medals[i] if i < len(medals) else f"{i + 1}."
         lines.append(f"{rank} {r['name']} — {r['correct']}/{r['scored']} correct")
+    if has_more:
+        lines.append(f"Next pool page: /leaderboard {page + 1}")
     await update.message.reply_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------- main
 
 
+async def guard_delivery_mode(bot, expected_url=""):
+    info = await bot.get_webhook_info()
+    if info.url and info.url != expected_url and not ALLOW_WEBHOOK_RESET:
+        raise RuntimeError(
+            "A different webhook is configured. Use a separate test bot or explicitly set WORLDCUP_ALLOW_WEBHOOK_RESET=true for an operator-approved mode switch."
+        )
+
+
 def main():
-    if BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+    if BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE" or BOT_TOKEN.startswith("replace-with-"):
         raise SystemExit(
-            "Set the WORLDCUP_BOT_TOKEN environment variable "
-            "or add it to local.env."
+            "Set the WORLDCUP_BOT_TOKEN environment variable or add it to local.env."
         )
 
     port = os.environ.get("PORT")
@@ -707,8 +975,22 @@ def main():
     if not ADMIN_USER_IDS:
         print("No pool admins are configured; management commands are disabled.")
 
+    mode = get_config("WORLDCUP_MODE") or "auto"
+    if mode not in ("auto", "polling", "webhook"):
+        raise SystemExit("WORLDCUP_MODE must be auto, polling, or webhook.")
+    if mode == "webhook" and not webhook_config:
+        raise SystemExit("Webhook mode requires PORT and a public URL.")
+    if mode == "polling" and webhook_config:
+        raise SystemExit(
+            "Remove hosted PORT/public URL settings before choosing polling."
+        )
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    expected_url = f"{webhook_config[1]}/telegram" if webhook_config else ""
+
+    async def preflight(application):
+        await guard_delivery_mode(application.bot, expected_url)
+
+    app = Application.builder().token(BOT_TOKEN).post_init(preflight).build()
     message_updates = filters.UpdateType.MESSAGE
     app.add_handler(CommandHandler("whereami", whereami, filters=message_updates))
     app.add_handler(CommandHandler("start", start, filters=message_updates))
@@ -723,6 +1005,7 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard, filters=message_updates))
     app.add_handler(CallbackQueryHandler(vote_button, pattern=VOTE_CALLBACK_RE))
     app.add_handler(CallbackQueryHandler(invalid_button))
+    app.add_error_handler(report_error)
 
     if webhook_config:
         webhook_port, webhook_base_url = webhook_config
